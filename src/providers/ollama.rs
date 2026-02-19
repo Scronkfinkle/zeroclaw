@@ -1,4 +1,8 @@
-use crate::providers::traits::Provider;
+use crate::providers::traits::{
+    ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
+    ProviderCapabilities, ToolCall as ProviderToolCall,
+};
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -16,6 +20,10 @@ struct ChatRequest {
     messages: Vec<Message>,
     stream: bool,
     options: Options,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<NativeToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -27,6 +35,20 @@ struct Message {
 #[derive(Debug, Serialize)]
 struct Options {
     temperature: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeToolSpec {
+    #[serde(rename = "type")]
+    kind: String,
+    function: NativeToolFunctionSpec,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeToolFunctionSpec {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 // ─── Response Structures ──────────────────────────────────────────────────────
@@ -112,6 +134,20 @@ impl OllamaProvider {
         Ok((normalized_model, should_auth))
     }
 
+    fn convert_tools(tools: &[ToolSpec]) -> Vec<NativeToolSpec> {
+        tools
+            .iter()
+            .map(|t| NativeToolSpec {
+                kind: "function".to_string(),
+                function: NativeToolFunctionSpec {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.parameters.clone(),
+                },
+            })
+            .collect()
+    }
+
     /// Send a request to Ollama and get the parsed response
     async fn send_request(
         &self,
@@ -119,12 +155,16 @@ impl OllamaProvider {
         model: &str,
         temperature: f64,
         should_auth: bool,
+        tools: Option<Vec<NativeToolSpec>>,
     ) -> anyhow::Result<ApiChatResponse> {
+        let tool_choice = tools.as_ref().map(|_| "auto".to_string());
         let request = ChatRequest {
             model: model.to_string(),
             messages,
             stream: false,
             options: Options { temperature },
+            tools,
+            tool_choice,
         };
 
         let url = format!("{}/api/chat", self.base_url);
@@ -281,7 +321,7 @@ impl Provider for OllamaProvider {
         });
 
         let response = self
-            .send_request(messages, &normalized_model, temperature, should_auth)
+            .send_request(messages, &normalized_model, temperature, should_auth, None)
             .await?;
 
         // If model returned tool calls, format them for loop_.rs's parse_tool_calls
@@ -331,7 +371,13 @@ impl Provider for OllamaProvider {
             .collect();
 
         let response = self
-            .send_request(api_messages, &normalized_model, temperature, should_auth)
+            .send_request(
+                api_messages,
+                &normalized_model,
+                temperature,
+                should_auth,
+                None,
+            )
             .await?;
 
         // If model returned tool calls, format them for loop_.rs's parse_tool_calls
@@ -366,11 +412,80 @@ impl Provider for OllamaProvider {
         Ok(content)
     }
 
-    fn supports_native_tools(&self) -> bool {
-        // Return false since loop_.rs uses XML-style tool parsing via system prompt
-        // The model may return native tool_calls but we convert them to JSON format
-        // that parse_tool_calls() understands
-        false
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let (normalized_model, should_auth) = self.resolve_request_details(model)?;
+
+        let api_messages: Vec<Message> = request
+            .messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+
+        let ollama_tools = request.tools.map(Self::convert_tools);
+
+        let response = self
+            .send_request(
+                api_messages,
+                &normalized_model,
+                temperature,
+                should_auth,
+                ollama_tools,
+            )
+            .await?;
+
+        let tool_calls: Vec<ProviderToolCall> = response
+            .message
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                let (name, args) = self.extract_tool_name_and_args(tc);
+                let arguments = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                ProviderToolCall {
+                    id: tc
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    name,
+                    arguments,
+                }
+            })
+            .collect();
+
+        let text = if response.message.content.is_empty() && tool_calls.is_empty() {
+            if let Some(thinking) = response.message.thinking {
+                tracing::warn!(
+                    "Ollama returned empty content with only thinking. Model may have stopped prematurely."
+                );
+                let excerpt = &thinking[..thinking.len().min(200)];
+                Some(format!(
+                    "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
+                    excerpt
+                ))
+            } else {
+                tracing::warn!("Ollama returned empty content with no tool calls");
+                None
+            }
+        } else if response.message.content.is_empty() {
+            None
+        } else {
+            Some(response.message.content)
+        };
+
+        Ok(ProviderChatResponse { text, tool_calls })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+        }
     }
 }
 

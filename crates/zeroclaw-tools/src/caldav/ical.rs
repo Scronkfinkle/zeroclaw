@@ -8,7 +8,7 @@
 //! timezone database — an `RRULE` that survives to this layer is reported
 //! verbatim and blocks writes rather than being interpreted.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 /// One `VEVENT`, reduced to the fields the tool surfaces.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -19,6 +19,9 @@ pub struct VEvent {
     pub location: Option<String>,
     /// Event start. `None` when `DTSTART` is missing or unparseable.
     pub start: Option<EventTime>,
+    /// Event end. RFC 5545 lets a component carry either `DTEND` or
+    /// `DURATION`; when only the latter is present this is derived from
+    /// `DTSTART` as the component closes, so callers see an end time either way.
     pub end: Option<EventTime>,
     /// Raw `RRULE` value when the component is a recurring master. Its presence
     /// is what [`VEvent::is_recurring`] reports, and it blocks writes.
@@ -68,6 +71,25 @@ impl EventTime {
         match self {
             Self::DateTime(dt) => Some(*dt),
             _ => None,
+        }
+    }
+
+    /// Offset this time by `delta`, preserving its kind.
+    ///
+    /// Used to derive an end time from `DURATION`. Returns `None` on overflow
+    /// rather than wrapping to a nonsense date.
+    fn checked_add(&self, delta: ChronoDuration) -> Option<Self> {
+        match self {
+            Self::DateTime(dt) => dt.checked_add_signed(delta).map(Self::DateTime),
+            Self::Date(d) => d.checked_add_signed(delta).map(Self::Date),
+            Self::DateTimeFloating { local, tzid } => {
+                local
+                    .checked_add_signed(delta)
+                    .map(|local| Self::DateTimeFloating {
+                        local,
+                        tzid: tzid.clone(),
+                    })
+            }
         }
     }
 
@@ -148,6 +170,9 @@ pub fn parse_events(ics: &str) -> Vec<VEvent> {
     // Depth of any non-VEVENT component we are inside (e.g. VTIMEZONE, or a
     // VALARM nested in a VEVENT). Properties there must not leak into the event.
     let mut skip_depth = 0usize;
+    // `DURATION` for the component being read. Resolved into `end` when the
+    // component closes, because DURATION may precede or follow DTSTART.
+    let mut duration: Option<ChronoDuration> = None;
 
     for line in lines {
         let trimmed = line.trim();
@@ -163,12 +188,22 @@ pub fn parse_events(ics: &str) -> Vec<VEvent> {
         }
         if upper == "BEGIN:VEVENT" && skip_depth == 0 {
             current = Some(VEvent::default());
+            duration = None;
             continue;
         }
         if upper == "END:VEVENT" && skip_depth == 0 {
-            if let Some(event) = current.take() {
+            if let Some(mut event) = current.take() {
+                // DTEND wins when both are present; RFC 5545 forbids that
+                // combination, but a server that sends both should not lose the
+                // explicit end.
+                if event.end.is_none()
+                    && let (Some(start), Some(d)) = (event.start.as_ref(), duration)
+                {
+                    event.end = start.checked_add(d);
+                }
                 events.push(event);
             }
+            duration = None;
             continue;
         }
         if upper.starts_with("BEGIN:") {
@@ -185,10 +220,77 @@ pub fn parse_events(ics: &str) -> Vec<VEvent> {
         let Some(event) = current.as_mut() else {
             continue;
         };
+        if let Some(parsed) = parse_duration_property(trimmed) {
+            duration = Some(parsed);
+            continue;
+        }
         apply_property(event, trimmed);
     }
 
     events
+}
+
+/// Parse a `DURATION:` line into a [`ChronoDuration`], or `None` when the line
+/// is a different property.
+fn parse_duration_property(line: &str) -> Option<ChronoDuration> {
+    let (name, _, value) = split_property(line)?;
+    if name != "DURATION" {
+        return None;
+    }
+    parse_duration(value)
+}
+
+/// Parse an RFC 5545 duration (`PnWnDTnHnMnS`, optionally signed).
+///
+/// Returns `None` for anything malformed, so a bad value leaves the end time
+/// absent rather than inventing one.
+fn parse_duration(value: &str) -> Option<ChronoDuration> {
+    let raw = value.trim();
+    let (negative, rest) = match raw.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, raw.strip_prefix('+').unwrap_or(raw)),
+    };
+    let mut chars = rest.strip_prefix(['P', 'p'])?.chars().peekable();
+
+    let mut total = ChronoDuration::zero();
+    let mut in_time = false;
+    let mut digits = String::new();
+    let mut saw_unit = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == 'T' || ch == 't' {
+            // A `T` with pending digits is malformed (`P1T`).
+            if !digits.is_empty() {
+                return None;
+            }
+            in_time = true;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        let n: i64 = digits.parse().ok()?;
+        digits.clear();
+        let unit = match (ch.to_ascii_uppercase(), in_time) {
+            ('W', false) => ChronoDuration::weeks(n),
+            ('D', false) => ChronoDuration::days(n),
+            ('H', true) => ChronoDuration::hours(n),
+            ('M', true) => ChronoDuration::minutes(n),
+            ('S', true) => ChronoDuration::seconds(n),
+            // e.g. `PT1D` or `P1H`: the unit is in the wrong section.
+            _ => return None,
+        };
+        total = total.checked_add(&unit)?;
+        saw_unit = true;
+        let _ = chars.peek();
+    }
+
+    // Trailing digits with no unit, or a bare `P`, are malformed.
+    if !digits.is_empty() || !saw_unit {
+        return None;
+    }
+    Some(if negative { -total } else { total })
 }
 
 fn apply_property(event: &mut VEvent, line: &str) {
@@ -475,6 +577,100 @@ mod tests {
                    BEGIN:VEVENT\r\nUID:x\r\nDTSTART:20260908T090000Z\r\nEND:VEVENT\r\n\
                    END:VCALENDAR\r\n";
         assert_eq!(parse_events(ics).len(), 2);
+    }
+
+    #[test]
+    fn parse_duration_covers_the_rfc5545_grammar() {
+        assert_eq!(parse_duration("PT1H"), Some(ChronoDuration::hours(1)));
+        assert_eq!(parse_duration("PT30M"), Some(ChronoDuration::minutes(30)));
+        assert_eq!(parse_duration("PT45S"), Some(ChronoDuration::seconds(45)));
+        assert_eq!(parse_duration("P1D"), Some(ChronoDuration::days(1)));
+        assert_eq!(parse_duration("P2W"), Some(ChronoDuration::weeks(2)));
+        assert_eq!(
+            parse_duration("P1DT2H30M"),
+            Some(ChronoDuration::days(1) + ChronoDuration::hours(2) + ChronoDuration::minutes(30))
+        );
+        assert_eq!(parse_duration("-PT1H"), Some(ChronoDuration::hours(-1)));
+        assert_eq!(parse_duration("+PT1H"), Some(ChronoDuration::hours(1)));
+    }
+
+    #[test]
+    fn parse_duration_rejects_malformed_values() {
+        // A bad duration must not silently become a zero-length event.
+        for bad in ["", "P", "1H", "PT", "PT1", "P1H", "PT1D", "PTX", "P1T"] {
+            assert_eq!(parse_duration(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn duration_supplies_the_end_when_dtend_is_absent() {
+        // Regression: Fastmail stores a timed event as DTSTART + DURATION with
+        // no DTEND, so reading only DTEND reported every such event as having
+        // no end time.
+        let ics = "BEGIN:VEVENT\r\nUID:k\r\nDTSTART:20260905T140000Z\r\n\
+                   DURATION:PT1H\r\nEND:VEVENT";
+        let events = parse_events(ics);
+        assert_eq!(
+            events[0].end,
+            Some(EventTime::DateTime(
+                Utc.with_ymd_and_hms(2026, 9, 5, 15, 0, 0).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn duration_before_dtstart_still_resolves() {
+        // Property order is not guaranteed.
+        let ics = "BEGIN:VEVENT\r\nUID:k\r\nDURATION:PT90M\r\n\
+                   DTSTART:20260905T140000Z\r\nEND:VEVENT";
+        assert_eq!(
+            parse_events(ics)[0].end,
+            Some(EventTime::DateTime(
+                Utc.with_ymd_and_hms(2026, 9, 5, 15, 30, 0).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn explicit_dtend_wins_over_duration() {
+        let ics = "BEGIN:VEVENT\r\nUID:k\r\nDTSTART:20260905T140000Z\r\n\
+                   DTEND:20260905T160000Z\r\nDURATION:PT1H\r\nEND:VEVENT";
+        assert_eq!(
+            parse_events(ics)[0].end,
+            Some(EventTime::DateTime(
+                Utc.with_ymd_and_hms(2026, 9, 5, 16, 0, 0).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn duration_applies_to_floating_and_all_day_starts() {
+        let ics = "BEGIN:VEVENT\r\nUID:f\r\nDTSTART;TZID=America/Chicago:20260905T090000\r\n\
+                   DURATION:PT1H\r\nEND:VEVENT";
+        let end = parse_events(ics)[0].end.clone().expect("end derived");
+        assert_eq!(end.to_display(), "2026-09-05T10:00:00 (America/Chicago)");
+
+        let ics = "BEGIN:VEVENT\r\nUID:d\r\nDTSTART;VALUE=DATE:20260905\r\n\
+                   DURATION:P1D\r\nEND:VEVENT";
+        assert_eq!(
+            parse_events(ics)[0].end,
+            Some(EventTime::Date(
+                NaiveDate::from_ymd_opt(2026, 9, 6).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn duration_inside_a_valarm_does_not_reach_the_event() {
+        // VALARM carries its own DURATION; using it as the event's end would
+        // be wrong.
+        let ics = "BEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260905T140000Z\r\n\
+                   BEGIN:VALARM\r\nDURATION:PT15M\r\nEND:VALARM\r\nEND:VEVENT";
+        assert_eq!(
+            parse_events(ics)[0].end,
+            None,
+            "an alarm's duration must not become the event's end"
+        );
     }
 
     #[test]

@@ -79,13 +79,13 @@ const CALENDAR_LIST_XML: &str = r#"<?xml version="1.0"?>
 /// principal chain runs.
 async fn mount_discovery(server: &MockServer) {
     Mock::given(method("PROPFIND"))
-        .and(path("/dav"))
+        .and(path("/dav/"))
         .and(body_string_contains("calendar-home-set"))
         .respond_with(ResponseTemplate::new(404))
         .mount(server)
         .await;
     Mock::given(method("PROPFIND"))
-        .and(path("/dav"))
+        .and(path("/dav/"))
         .and(body_string_contains("current-user-principal"))
         .respond_with(ResponseTemplate::new(207).set_body_string(PRINCIPAL_XML))
         .mount(server)
@@ -355,7 +355,7 @@ async fn discovery_sends_basic_auth() {
     // Scoped to the DAV root: without the path constraint this would also
     // swallow the calendar-home PROPFIND aimed at the principal URL.
     Mock::given(method("PROPFIND"))
-        .and(path("/dav"))
+        .and(path("/dav/"))
         .and(header("authorization", expected.as_str()))
         .and(body_string_contains("calendar-home-set"))
         .respond_with(ResponseTemplate::new(404))
@@ -363,7 +363,7 @@ async fn discovery_sends_basic_auth() {
         .mount(&server)
         .await;
     Mock::given(method("PROPFIND"))
-        .and(path("/dav"))
+        .and(path("/dav/"))
         .and(header("authorization", expected.as_str()))
         .and(body_string_contains("current-user-principal"))
         .respond_with(ResponseTemplate::new(207).set_body_string(PRINCIPAL_XML))

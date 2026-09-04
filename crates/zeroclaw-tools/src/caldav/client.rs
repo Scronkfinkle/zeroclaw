@@ -55,7 +55,12 @@ impl CalDavClient {
         nat64_prefixes: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            // Normalize *to* a trailing slash, never away from it. `base_url`
+            // names a WebDAV collection, and Cyrus (Fastmail) answers PROPFIND
+            // on `/dav/` but returns 405 for `/dav`. The slash also makes
+            // `Url::join` resolve a relative href inside the collection rather
+            // than against its parent.
+            base_url: format!("{}/", base_url.trim().trim_end_matches('/')),
             username,
             password,
             // A zero timeout would mean "no timeout" in reqwest, turning a
@@ -388,8 +393,30 @@ mod tests {
     }
 
     #[test]
-    fn base_url_trailing_slash_is_normalized() {
-        assert_eq!(client("https://e.com/dav/").base_url(), "https://e.com/dav");
+    fn base_url_always_keeps_a_trailing_slash() {
+        // Regression: stripping the slash made Cyrus (Fastmail) answer PROPFIND
+        // on the DAV root with 405 Method Not Allowed, so discovery never
+        // started. Both spellings must normalize to the collection form.
+        assert_eq!(
+            client("https://e.com/dav/").base_url(),
+            "https://e.com/dav/"
+        );
+        assert_eq!(client("https://e.com/dav").base_url(), "https://e.com/dav/");
+        assert_eq!(
+            client("https://e.com/dav///").base_url(),
+            "https://e.com/dav/"
+        );
+    }
+
+    #[test]
+    fn relative_href_resolves_inside_the_collection_not_its_parent() {
+        // This is the second reason the trailing slash matters: without it,
+        // `Url::join` would resolve "work/" against `/dav`'s parent.
+        let c = client("https://e.com/dav");
+        assert_eq!(
+            c.resolve_href("work/").expect("resolves"),
+            "https://e.com/dav/work/"
+        );
     }
 
     #[test]

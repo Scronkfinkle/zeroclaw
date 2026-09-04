@@ -32886,6 +32886,125 @@ runtime_profile = "default"
         assert!(config.validate().is_ok());
     }
 
+    /// A `[caldav]` block with credentials filled in, for the tests below.
+    fn caldav_enabled_config() -> Config {
+        let mut config = Config::default();
+        config.caldav.enabled = true;
+        config.caldav.base_url = "https://caldav.example.test/dav/".into();
+        config.caldav.username = "user@example.test".into();
+        config.caldav.password = "app-password".into();
+        config
+    }
+
+    #[test]
+    async fn caldav_defaults_to_disabled_and_read_only() {
+        let caldav = CalDavConfig::default();
+        assert!(!caldav.enabled, "the tool must not register by default");
+        assert!(
+            !caldav.allow_private_hosts,
+            "the SSRF guard must be closed by default"
+        );
+        // Shipping any write action on by default would let a first run delete
+        // real calendar entries.
+        assert_eq!(
+            caldav.allowed_actions,
+            vec!["list_calendars", "list_events", "get_event"]
+        );
+    }
+
+    #[test]
+    async fn validate_requires_caldav_credentials_when_enabled() {
+        for (field, expected) in [
+            ("base_url", "caldav.base_url must not be empty"),
+            ("username", "caldav.username must not be empty"),
+        ] {
+            let mut config = caldav_enabled_config();
+            if field == "base_url" {
+                config.caldav.base_url = String::new();
+            } else {
+                config.caldav.username = String::new();
+            }
+            let err = config
+                .validate()
+                .expect_err("missing credential is rejected")
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "expected {expected:?} for missing {field}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_requires_caldav_password_when_no_env_fallback() {
+        // The password check falls back to CALDAV_PASSWORD. Env is process-wide
+        // and these tests run in parallel, so rather than mutate it, skip when
+        // an ambient value would legitimately satisfy the check.
+        if !std::env::var("CALDAV_PASSWORD")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            return;
+        }
+        let mut config = caldav_enabled_config();
+        config.caldav.password = String::new();
+        let err = config
+            .validate()
+            .expect_err("missing password is rejected")
+            .to_string();
+        assert!(err.contains("caldav.password must be set"), "got: {err}");
+        assert!(
+            err.contains("CALDAV_PASSWORD"),
+            "the error should name the env fallback: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_ignores_caldav_when_disabled() {
+        // An incomplete but disabled section must not block startup.
+        let config = Config::default();
+        assert!(config.caldav.base_url.is_empty());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_rejects_unknown_caldav_actions() {
+        for action in ["create_calendar", "drop_calendar", ""] {
+            let mut config = caldav_enabled_config();
+            config.caldav.allowed_actions = vec![action.into()];
+
+            let err = config
+                .validate()
+                .expect_err("unknown CalDAV action should be rejected")
+                .to_string();
+            assert!(
+                err.contains("caldav.allowed_actions contains unknown action"),
+                "expected CalDAV allowed action error for {action:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_all_published_caldav_actions() {
+        let mut config = caldav_enabled_config();
+        config.caldav.allowed_actions = [
+            "list_calendars",
+            "list_events",
+            "get_event",
+            "create_event",
+            "update_event",
+            "delete_event",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        assert!(
+            config.validate().is_ok(),
+            "every documented action must pass validation"
+        );
+    }
+
     #[test]
     async fn validate_rejects_unknown_jira_actions() {
         for action in ["delete_ticket", "drop_database", ""] {

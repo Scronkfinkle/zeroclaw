@@ -571,6 +571,12 @@ pub struct Config {
     #[group = "Integrations"]
     pub jira: JiraConfig,
 
+    /// CalDAV calendar configuration (`[caldav]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Integrations"]
+    pub caldav: CalDavConfig,
+
     /// Knowledge graph configuration (`[knowledge]`).
     #[serde(default)]
     #[nested]
@@ -18965,6 +18971,102 @@ impl Default for JiraConfig {
     }
 }
 
+/// CalDAV calendar configuration (`[caldav]`).
+///
+/// When `enabled = true`, registers the `caldav` tool, which lists calendars,
+/// reads events over a date range, and (once the corresponding action is
+/// allow-listed) creates, updates, and deletes events. Requires `base_url`,
+/// `username`, and `password`.
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_actions`: `["list_calendars", "list_events", "get_event"]` —
+///   read-only. Add `"create_event"`, `"update_event"`, or `"delete_event"` to
+///   let the agent modify a calendar.
+/// - `allow_private_hosts`: `false`
+/// - `timeout_secs`: `30`
+///
+/// ## Auth
+/// HTTP Basic over TLS. For Fastmail and iCloud this is an app-specific
+/// password, not the account password. `password` is stored encrypted at rest;
+/// set it here or via `CALDAV_PASSWORD`.
+///
+/// ## Recurring events
+/// Recurrence is expanded server-side on read (RFC 4791 `<C:expand>`). Editing
+/// or deleting a recurring series is refused, because a write would silently
+/// rewrite every occurrence.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "caldav"]
+pub struct CalDavConfig {
+    /// Enable the `caldav` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// CalDAV endpoint, e.g. `https://caldav.fastmail.com/dav/`. Principal and
+    /// calendar-home discovery start here, so the server's documented DAV root
+    /// is the right value; a bare origin usually works too.
+    #[serde(default)]
+    pub base_url: String,
+    /// Account username, usually the full email address.
+    #[serde(default)]
+    pub username: String,
+    /// CalDAV password or app-specific password. Encrypted at rest. Falls back
+    /// to the `CALDAV_PASSWORD` env var.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub password: String,
+    /// Calendar used when a tool call omits `calendar`. Accepts either a
+    /// calendar href or its display name. When unset, the first calendar
+    /// returned by discovery is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_calendar: Option<String>,
+    /// Actions the agent is permitted to call.
+    /// Valid values: `"list_calendars"`, `"list_events"`, `"get_event"`,
+    /// `"create_event"`, `"update_event"`, `"delete_event"`.
+    /// Defaults to the three read actions.
+    #[serde(default = "default_caldav_allowed_actions")]
+    pub allowed_actions: Vec<String>,
+    /// Allow `base_url` to resolve to a private, loopback, or link-local
+    /// address. Default: `false`. Enable this only for a self-hosted server on
+    /// your own network (Radicale, Baikal, Nextcloud); it relaxes the SSRF
+    /// guard that otherwise keeps an operator-supplied URL off the local
+    /// network.
+    #[serde(default)]
+    pub allow_private_hosts: bool,
+    /// Request timeout in seconds. Default: `30`.
+    #[serde(default = "default_caldav_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_caldav_allowed_actions() -> Vec<String> {
+    vec![
+        "list_calendars".to_string(),
+        "list_events".to_string(),
+        "get_event".to_string(),
+    ]
+}
+
+fn default_caldav_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for CalDavConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            default_calendar: None,
+            allowed_actions: default_caldav_allowed_actions(),
+            allow_private_hosts: false,
+            timeout_secs: default_caldav_timeout_secs(),
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -19310,6 +19412,7 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            caldav: CalDavConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
@@ -22622,6 +22725,42 @@ impl Config {
                     anyhow::bail!(
                         "jira.allowed_actions contains unknown action: '{}'. \
                          Valid: get_ticket, search_tickets, comment_ticket, list_projects, myself, list_transitions, transition_ticket, create_ticket",
+                        action
+                    );
+                }
+            }
+        }
+
+        if self.caldav.enabled {
+            if self.caldav.base_url.trim().is_empty() {
+                anyhow::bail!("caldav.base_url must not be empty when caldav.enabled = true");
+            }
+            if self.caldav.username.trim().is_empty() {
+                anyhow::bail!("caldav.username must not be empty when caldav.enabled = true");
+            }
+            if self.caldav.password.trim().is_empty()
+                && std::env::var("CALDAV_PASSWORD")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                anyhow::bail!(
+                    "caldav.password must be set (or CALDAV_PASSWORD env var) when caldav.enabled = true"
+                );
+            }
+            let valid_actions = [
+                "list_calendars",
+                "list_events",
+                "get_event",
+                "create_event",
+                "update_event",
+                "delete_event",
+            ];
+            for action in &self.caldav.allowed_actions {
+                if !valid_actions.contains(&action.as_str()) {
+                    anyhow::bail!(
+                        "caldav.allowed_actions contains unknown action: '{}'. \
+                         Valid: list_calendars, list_events, get_event, create_event, update_event, delete_event",
                         action
                     );
                 }
@@ -28365,6 +28504,7 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            caldav: CalDavConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
@@ -29323,6 +29463,7 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            caldav: CalDavConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),

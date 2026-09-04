@@ -12,6 +12,7 @@ pub mod browser;
 pub mod browser_delegate;
 pub mod browser_open;
 pub mod calculator;
+pub mod caldav;
 pub mod canvas;
 pub mod channel_room;
 pub mod claude_code;

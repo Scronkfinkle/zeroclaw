@@ -111,6 +111,7 @@
 - [Tools & Extensibility](./tools/overview.md)
   - [MCP (Model Context Protocol)](./tools/mcp.md)
   - [Browser automation](./tools/browser.md)
+  - [CalDAV calendar](./tools/caldav.md)
   - [Relationship memory](./tools/relationship-memory.md)
     - [Using relationship memory from skills](./tools/relationship-memory-skill-template.md)
   - [Skills](./tools/skills.md)

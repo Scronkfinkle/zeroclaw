@@ -42,6 +42,7 @@ pub use zeroclaw_tools::browser::{BrowserTool, ComputerUseConfig};
 pub use zeroclaw_tools::browser_delegate::BrowserDelegateTool;
 pub use zeroclaw_tools::browser_open::BrowserOpenTool;
 pub use zeroclaw_tools::calculator::CalculatorTool;
+pub use zeroclaw_tools::caldav::CalDavTool;
 pub use zeroclaw_tools::canvas::{ALLOWED_CONTENT_TYPES, MAX_CONTENT_SIZE};
 pub use zeroclaw_tools::canvas::{CanvasStore, CanvasTool};
 pub use zeroclaw_tools::channel_room::ChannelRoomTool;
@@ -1296,6 +1297,62 @@ pub fn all_tools_with_runtime(
                 security.clone(),
                 root_config.jira.timeout_secs,
             )));
+        }
+    }
+
+    // CalDAV calendar (config-gated)
+    if root_config.caldav.enabled {
+        let password = if root_config.caldav.password.trim().is_empty() {
+            std::env::var("CALDAV_PASSWORD").unwrap_or_default()
+        } else {
+            root_config.caldav.password.trim().to_string()
+        };
+        if password.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "CalDAV tool enabled but no password found (set caldav.password or CALDAV_PASSWORD env var)"
+            );
+        } else if root_config.caldav.base_url.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "CalDAV tool enabled but caldav.base_url is empty — skipping registration"
+            );
+        } else if root_config.caldav.username.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "CalDAV tool enabled but caldav.username is empty — skipping registration"
+            );
+        } else {
+            match CalDavTool::new(
+                root_config.caldav.base_url.trim().to_string(),
+                root_config.caldav.username.trim().to_string(),
+                password,
+                root_config.caldav.default_calendar.clone(),
+                root_config.caldav.allowed_actions.clone(),
+                root_config.caldav.allow_private_hosts,
+                root_config.security.nat64_prefixes.clone(),
+                root_config.caldav.timeout_secs,
+                security.clone(),
+            ) {
+                Ok(tool) => {
+                    tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "caldav: failed to construct tool, skipping registration"
+                    );
+                }
+            }
         }
     }
 

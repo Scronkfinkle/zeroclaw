@@ -24,7 +24,7 @@ use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
 use client::{CalDavClient, WriteOutcome};
 use discovery::{Calendar, select_calendar};
-use ical::{EventTime, VEvent};
+use ical::{CalendarObject, EventTime, PropertyChange, VEvent};
 
 /// Every action this tool understands.
 const VALID_ACTIONS: &[&str] = &[
@@ -195,13 +195,17 @@ impl CalDavTool {
         Ok(out)
     }
 
-    /// Locate an event by UID, returning it with the href and ETag needed to
-    /// write to it.
+    /// Locate an event by UID, returning the whole calendar object plus the
+    /// href and ETag needed to write to it.
+    ///
+    /// The full object is carried, not just the parsed [`VEvent`], so an update
+    /// can patch the original document instead of regenerating it and losing
+    /// everything the parser does not model.
     async fn find_event(
         &self,
         calendar: &Calendar,
         uid: &str,
-    ) -> anyhow::Result<Option<(VEvent, String, Option<String>)>> {
+    ) -> anyhow::Result<Option<(CalendarObject, String, Option<String>)>> {
         let body = xml::calendar_query_by_uid_body(uid);
         let responses = self
             .client
@@ -213,9 +217,12 @@ impl CalDavTool {
             let Some(data) = r.calendar_data.as_deref() else {
                 continue;
             };
-            if let Some(event) = ical::parse_events(data).into_iter().find(|e| e.uid == uid) {
+            let Some(object) = CalendarObject::parse(data) else {
+                continue;
+            };
+            if object.event.uid == uid {
                 let url = self.client.resolve_href(&r.href)?;
-                return Ok(Some((event, url, r.etag)));
+                return Ok(Some((object, url, r.etag)));
             }
         }
         Ok(None)
@@ -225,8 +232,8 @@ impl CalDavTool {
         let uid = require_str(args, "uid")?;
         let calendar = self.target_calendar(args).await?;
         match self.find_event(&calendar, uid).await? {
-            Some((event, url, etag)) => {
-                let mut value = event_json(&event, Some(&url), etag.as_deref());
+            Some((object, url, etag)) => {
+                let mut value = event_json(&object.event, Some(&url), etag.as_deref());
                 value["calendar"] = json!(calendar.label());
                 Ok(value)
             }
@@ -282,13 +289,13 @@ impl CalDavTool {
         let uid = require_str(args, "uid")?;
         let calendar = self.target_calendar(args).await?;
 
-        let Some((existing, url, etag)) = self.find_event(&calendar, uid).await? else {
+        let Some((object, url, etag)) = self.find_event(&calendar, uid).await? else {
             anyhow::bail!(
                 "no event with uid '{uid}' in calendar '{}'",
                 calendar.label()
             );
         };
-        reject_recurring(&existing, "update")?;
+        reject_recurring(&object.event, "update")?;
 
         let etag = etag.ok_or_else(|| {
             anyhow::Error::msg(format!(
@@ -297,39 +304,83 @@ impl CalDavTool {
             ))
         })?;
 
-        // Start from the stored event so unspecified fields are preserved
-        // rather than blanked.
-        let mut updated = existing.clone();
+        // Build the change set from the arguments actually supplied. Anything
+        // not named here keeps whatever the server holds, including properties
+        // and sub-components this tool does not model.
+        let mut changes = Vec::new();
+        let mut updated = object.event.clone();
+
         if let Some(v) = optional_string(args, "summary") {
+            changes.push(PropertyChange::set(
+                "SUMMARY",
+                format!("SUMMARY:{}", ical::escape_text(&v)),
+            ));
             updated.summary = Some(v);
         }
         if let Some(v) = optional_string(args, "description") {
+            changes.push(PropertyChange::set(
+                "DESCRIPTION",
+                format!("DESCRIPTION:{}", ical::escape_text(&v)),
+            ));
             updated.description = Some(v);
         }
         if let Some(v) = optional_string(args, "location") {
+            changes.push(PropertyChange::set(
+                "LOCATION",
+                format!("LOCATION:{}", ical::escape_text(&v)),
+            ));
             updated.location = Some(v);
         }
         if args.get("start").is_some() {
-            updated.start = Some(require_time(args, "start")?);
+            let start = require_time(args, "start")?;
+            changes.push(PropertyChange::set("DTSTART", start.to_property("DTSTART")));
+            updated.start = Some(start);
         }
         if args.get("end").is_some() {
-            updated.end = Some(require_time(args, "end")?);
+            let end = require_time(args, "end")?;
+            changes.push(PropertyChange::set("DTEND", end.to_property("DTEND")));
+            // DTEND and DURATION are mutually exclusive under RFC 5545, and
+            // Fastmail stores timed events with DURATION. Writing DTEND without
+            // dropping DURATION would produce an invalid component.
+            changes.push(PropertyChange::remove("DURATION"));
+            updated.end = Some(end);
         }
         let attendees = string_list(args, "attendees");
         if !attendees.is_empty() {
+            changes.push(PropertyChange::replace(
+                "ATTENDEE",
+                attendees
+                    .iter()
+                    .map(|a| format!("ATTENDEE:{}", ical::escape_text(a)))
+                    .collect(),
+            ));
             updated.attendees = attendees;
         }
 
-        if updated == existing {
+        if changes.is_empty() {
             anyhow::bail!(
                 "no changes supplied for event '{uid}'; pass at least one of \
                  summary, description, location, start, end, attendees"
             );
         }
 
+        // Stamp the revision so other clients see the edit.
+        changes.push(PropertyChange::set(
+            "LAST-MODIFIED",
+            format!("LAST-MODIFIED:{}", Utc::now().format("%Y%m%dT%H%M%SZ")),
+        ));
+        changes.push(PropertyChange::set(
+            "DTSTAMP",
+            format!("DTSTAMP:{}", Utc::now().format("%Y%m%dT%H%M%SZ")),
+        ));
+        changes.push(PropertyChange::set(
+            "SEQUENCE",
+            format!("SEQUENCE:{}", object.event.sequence.unwrap_or(0) + 1),
+        ));
+
         match self
             .client
-            .put_object(&url, updated.to_ics(), Some(&etag), None)
+            .put_object(&url, object.patched(&changes), Some(&etag), None)
             .await?
         {
             WriteOutcome::Ok { etag } => {
@@ -358,13 +409,13 @@ impl CalDavTool {
                 calendar.label()
             );
         };
-        reject_recurring(&existing, "delete")?;
+        reject_recurring(&existing.event, "delete")?;
 
         match self.client.delete_object(&url, etag.as_deref()).await? {
             WriteOutcome::Ok { .. } => Ok(json!({
                 "deleted": true,
                 "uid": uid,
-                "summary": existing.summary,
+                "summary": existing.event.summary,
                 "calendar": calendar.label(),
             })),
             WriteOutcome::PreconditionFailed => anyhow::bail!(
@@ -413,6 +464,7 @@ fn event_json(event: &VEvent, href: Option<&str>, etag: Option<&str>) -> serde_j
         "attendees": event.attendees,
         "recurring": event.is_recurring(),
         "rrule": event.rrule,
+        "reminder_count": event.alarm_count,
         "href": href,
         "etag": etag,
     })

@@ -31,6 +31,12 @@ pub struct VEvent {
     pub status: Option<String>,
     pub organizer: Option<String>,
     pub attendees: Vec<String>,
+    /// `SEQUENCE`, the component's revision counter. An update bumps it so
+    /// other clients and attendees see the edit as newer.
+    pub sequence: Option<u32>,
+    /// Number of `VALARM` sub-components. Reported so a caller can tell that
+    /// an event has reminders attached without this parser modelling them.
+    pub alarm_count: usize,
 }
 
 /// A `DTSTART`/`DTEND` value. All-day events carry a date with no time, and
@@ -94,7 +100,7 @@ impl EventTime {
     }
 
     /// Serialize back to an iCalendar property value plus any parameters.
-    fn to_property(&self, name: &str) -> String {
+    pub fn to_property(&self, name: &str) -> String {
         match self {
             Self::DateTime(dt) => {
                 format!("{}:{}", name, dt.format("%Y%m%dT%H%M%SZ"))
@@ -158,6 +164,174 @@ impl VEvent {
     }
 }
 
+/// A change to apply to an existing component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyChange {
+    /// Replace the single occurrence of this property, or append it when absent.
+    Set { name: String, line: String },
+    /// Drop every occurrence of this property.
+    Remove { name: String },
+    /// Replace every occurrence of a repeatable property with these lines.
+    /// An empty `lines` removes them all.
+    Replace { name: String, lines: Vec<String> },
+}
+
+impl PropertyChange {
+    pub fn set(name: &str, line: impl Into<String>) -> Self {
+        Self::Set {
+            name: name.to_string(),
+            line: line.into(),
+        }
+    }
+
+    pub fn remove(name: &str) -> Self {
+        Self::Remove {
+            name: name.to_string(),
+        }
+    }
+
+    pub fn replace(name: &str, lines: Vec<String>) -> Self {
+        Self::Replace {
+            name: name.to_string(),
+            lines,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Set { name, .. } | Self::Remove { name } | Self::Replace { name, .. } => name,
+        }
+    }
+}
+
+/// A calendar object exactly as the server sent it, plus a parsed view of its
+/// event.
+///
+/// Updates patch this document in place rather than regenerating it from
+/// [`VEvent`]. Regenerating would silently discard everything the narrow parser
+/// does not model: `VALARM` reminders, `ORGANIZER`, `SEQUENCE`, `TRANSP`,
+/// `VTIMEZONE` definitions, and any `X-` property the server or another client
+/// relies on.
+#[derive(Debug, Clone)]
+pub struct CalendarObject {
+    /// The original document, unfolded one content line per entry.
+    lines: Vec<String>,
+    /// Parsed view of the event this object holds.
+    pub event: VEvent,
+}
+
+impl CalendarObject {
+    /// Parse a document and keep it intact alongside its first `VEVENT`.
+    ///
+    /// Returns `None` when the document holds no event.
+    pub fn parse(ics: &str) -> Option<Self> {
+        let event = parse_events(ics).into_iter().next()?;
+        Some(Self {
+            lines: unfold(ics),
+            event,
+        })
+    }
+
+    /// The document's content lines, unfolded.
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Apply `changes` to the first `VEVENT` and render the document.
+    ///
+    /// Only lines belonging to the event's own property block are considered.
+    /// Nested components (`VALARM`) and sibling components (`VTIMEZONE`) pass
+    /// through byte-for-byte, which is what makes an update non-destructive.
+    pub fn patched(&self, changes: &[PropertyChange]) -> String {
+        let mut out: Vec<String> = Vec::with_capacity(self.lines.len() + changes.len());
+        let mut in_event = false;
+        let mut done_event = false;
+        let mut nested = 0usize;
+        // Which `Set`/`Replace` changes already found a line to overwrite;
+        // the rest are appended before END:VEVENT.
+        let mut applied: Vec<bool> = vec![false; changes.len()];
+
+        for line in &self.lines {
+            let upper = line.trim().to_ascii_uppercase();
+
+            if !in_event && !done_event && upper == "BEGIN:VEVENT" {
+                in_event = true;
+                out.push(line.clone());
+                continue;
+            }
+            if in_event && nested == 0 && upper == "END:VEVENT" {
+                // Append anything that had no existing line to replace.
+                for (idx, change) in changes.iter().enumerate() {
+                    if applied[idx] {
+                        continue;
+                    }
+                    match change {
+                        PropertyChange::Set { line, .. } => out.push(line.clone()),
+                        PropertyChange::Replace { lines, .. } => out.extend(lines.iter().cloned()),
+                        PropertyChange::Remove { .. } => {}
+                    }
+                }
+                in_event = false;
+                done_event = true;
+                out.push(line.clone());
+                continue;
+            }
+            if in_event {
+                if upper.starts_with("BEGIN:") {
+                    nested += 1;
+                } else if upper.starts_with("END:") {
+                    nested = nested.saturating_sub(1);
+                }
+                // Inside a VALARM or other sub-component: never rewrite.
+                if nested > 0 || upper.starts_with("END:") {
+                    out.push(line.clone());
+                    continue;
+                }
+
+                if let Some(name) = property_name(line)
+                    && let Some(idx) = changes.iter().position(|c| c.name() == name)
+                {
+                    match &changes[idx] {
+                        PropertyChange::Remove { .. } => { /* drop this line */ }
+                        PropertyChange::Set { line: new, .. } => {
+                            if !applied[idx] {
+                                out.push(new.clone());
+                                applied[idx] = true;
+                            }
+                            // A duplicate of a single-valued property is dropped.
+                        }
+                        PropertyChange::Replace { lines: new, .. } => {
+                            if !applied[idx] {
+                                out.extend(new.iter().cloned());
+                                applied[idx] = true;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            out.push(line.clone());
+        }
+
+        let folded: Vec<String> = out.iter().map(|l| fold_line(l)).collect();
+        format!("{}\r\n", folded.join("\r\n"))
+    }
+}
+
+/// The uppercased property name of a content line, or `None` for a
+/// component delimiter or a malformed line.
+fn property_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (name, _, _) = split_property(trimmed)?;
+    if name == "BEGIN" || name == "END" {
+        return None;
+    }
+    Some(name)
+}
+
 /// Parse every `VEVENT` in an iCalendar document.
 ///
 /// A `VCALENDAR` from an expanded `calendar-query` holds one component per
@@ -207,6 +381,14 @@ pub fn parse_events(ics: &str) -> Vec<VEvent> {
             continue;
         }
         if upper.starts_with("BEGIN:") {
+            // A VALARM directly inside this event is a reminder. Count it while
+            // still skipping its properties, which belong to the alarm.
+            if upper == "BEGIN:VALARM"
+                && skip_depth == 0
+                && let Some(event) = current.as_mut()
+            {
+                event.alarm_count += 1;
+            }
             skip_depth += 1;
             continue;
         }
@@ -307,6 +489,7 @@ fn apply_property(event: &mut VEvent, line: &str) {
         "ATTENDEE" => event.attendees.push(unescape_text(value)),
         "RRULE" => event.rrule = Some(value.to_string()),
         "RECURRENCE-ID" => event.recurrence_id = Some(value.to_string()),
+        "SEQUENCE" => event.sequence = value.trim().parse().ok(),
         "DTSTART" => event.start = parse_time(value, &params),
         "DTEND" => event.end = parse_time(value, &params),
         _ => {}
@@ -448,7 +631,7 @@ fn fold_line(line: &str) -> String {
 }
 
 /// Escape the RFC 5545 TEXT specials: backslash, newline, comma, semicolon.
-fn escape_text(value: &str) -> String {
+pub fn escape_text(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -577,6 +760,158 @@ mod tests {
                    BEGIN:VEVENT\r\nUID:x\r\nDTSTART:20260908T090000Z\r\nEND:VEVENT\r\n\
                    END:VCALENDAR\r\n";
         assert_eq!(parse_events(ics).len(), 2);
+    }
+
+    /// A document shaped like what Fastmail actually returns: a VTIMEZONE
+    /// sibling, a VALARM child, an ORGANIZER, and proprietary X- properties.
+    const REAL_WORLD_ICS: &str = "BEGIN:VCALENDAR\r\n\
+        VERSION:2.0\r\n\
+        PRODID:-//CyrusIMAP.org//EN\r\n\
+        BEGIN:VTIMEZONE\r\n\
+        TZID:America/Chicago\r\n\
+        BEGIN:DAYLIGHT\r\n\
+        TZOFFSETFROM:-0600\r\n\
+        TZOFFSETTO:-0500\r\n\
+        END:DAYLIGHT\r\n\
+        END:VTIMEZONE\r\n\
+        BEGIN:VEVENT\r\n\
+        UID:abc\r\n\
+        SUMMARY:Kayaking\r\n\
+        LOCATION;JSID=1:Lake Como\r\n\
+        DTSTART;TZID=America/Chicago:20260905T090000\r\n\
+        DURATION:PT1H\r\n\
+        SEQUENCE:3\r\n\
+        TRANSP:OPAQUE\r\n\
+        ORGANIZER;CN=Ana:mailto:ana@example.com\r\n\
+        X-JMAP-USEDEFAULTALERTS;VALUE=BOOLEAN:TRUE\r\n\
+        BEGIN:VALARM\r\n\
+        ACTION:DISPLAY\r\n\
+        TRIGGER:-PT15M\r\n\
+        DESCRIPTION:Reminder\r\n\
+        END:VALARM\r\n\
+        END:VEVENT\r\n\
+        END:VCALENDAR\r\n";
+
+    #[test]
+    fn patching_preserves_everything_it_was_not_asked_to_change() {
+        // Regression: the previous update path regenerated the document from
+        // the parsed struct, silently dropping the alarm, the organizer, the
+        // timezone definition, and every X- property.
+        let object = CalendarObject::parse(REAL_WORLD_ICS).expect("parses");
+        let out = object.patched(&[PropertyChange::set("SUMMARY", "SUMMARY:Canoeing")]);
+
+        assert!(out.contains("SUMMARY:Canoeing"), "the edit must land");
+        assert!(!out.contains("SUMMARY:Kayaking"), "old value must be gone");
+
+        for preserved in [
+            "BEGIN:VALARM",
+            "TRIGGER:-PT15M",
+            "ACTION:DISPLAY",
+            "BEGIN:VTIMEZONE",
+            "TZID:America/Chicago",
+            "TZOFFSETTO:-0500",
+            "ORGANIZER;CN=Ana:mailto:ana@example.com",
+            "TRANSP:OPAQUE",
+            "X-JMAP-USEDEFAULTALERTS",
+            "LOCATION;JSID=1:Lake Como",
+            "DURATION:PT1H",
+        ] {
+            assert!(out.contains(preserved), "lost {preserved:?} from:\n{out}");
+        }
+    }
+
+    #[test]
+    fn patching_does_not_touch_identically_named_properties_inside_valarm() {
+        // VALARM has its own DESCRIPTION. Editing the event's DESCRIPTION must
+        // not rewrite the alarm's.
+        let object = CalendarObject::parse(REAL_WORLD_ICS).expect("parses");
+        let out = object.patched(&[PropertyChange::set("DESCRIPTION", "DESCRIPTION:Event body")]);
+        assert!(
+            out.contains("DESCRIPTION:Reminder"),
+            "alarm text must survive"
+        );
+        assert!(
+            out.contains("DESCRIPTION:Event body"),
+            "event body must be added"
+        );
+    }
+
+    #[test]
+    fn set_appends_a_property_that_was_absent() {
+        let object = CalendarObject::parse(REAL_WORLD_ICS).expect("parses");
+        let out = object.patched(&[PropertyChange::set("STATUS", "STATUS:CANCELLED")]);
+        assert!(out.contains("STATUS:CANCELLED"));
+        // It must land inside the event, not after it.
+        let status_at = out.find("STATUS:CANCELLED").unwrap();
+        let end_at = out.find("END:VEVENT").unwrap();
+        assert!(
+            status_at < end_at,
+            "property appended outside the component"
+        );
+    }
+
+    #[test]
+    fn remove_drops_every_occurrence() {
+        let object = CalendarObject::parse(REAL_WORLD_ICS).expect("parses");
+        let out = object.patched(&[PropertyChange::remove("DURATION")]);
+        assert!(!out.contains("DURATION:PT1H"));
+        // The alarm's TRIGGER is not a DURATION property and must remain.
+        assert!(out.contains("TRIGGER:-PT15M"));
+    }
+
+    #[test]
+    fn replace_swaps_all_occurrences_of_a_repeatable_property() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\n\
+            ATTENDEE:mailto:one@example.com\r\nATTENDEE:mailto:two@example.com\r\n\
+            SUMMARY:S\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let object = CalendarObject::parse(ics).expect("parses");
+        let out = object.patched(&[PropertyChange::replace(
+            "ATTENDEE",
+            vec!["ATTENDEE:mailto:three@example.com".to_string()],
+        )]);
+        assert!(!out.contains("one@example.com"));
+        assert!(!out.contains("two@example.com"));
+        assert_eq!(out.matches("ATTENDEE:").count(), 1);
+        assert!(out.contains("three@example.com"));
+    }
+
+    #[test]
+    fn patched_output_is_valid_and_reparses() {
+        let object = CalendarObject::parse(REAL_WORLD_ICS).expect("parses");
+        let out = object.patched(&[
+            PropertyChange::set("SUMMARY", "SUMMARY:Canoeing"),
+            PropertyChange::set("SEQUENCE", "SEQUENCE:4"),
+        ]);
+        let back = CalendarObject::parse(&out).expect("reparses");
+        assert_eq!(back.event.summary.as_deref(), Some("Canoeing"));
+        assert_eq!(back.event.sequence, Some(4));
+        assert_eq!(
+            back.event.alarm_count, 1,
+            "the alarm survived the round trip"
+        );
+        // DURATION still drives the end time.
+        assert_eq!(
+            back.event.end.as_ref().map(EventTime::to_display),
+            Some("2026-09-05T10:00:00 (America/Chicago)".to_string())
+        );
+        assert!(out.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn sequence_and_alarm_count_are_parsed() {
+        let object = CalendarObject::parse(REAL_WORLD_ICS).expect("parses");
+        assert_eq!(object.event.sequence, Some(3));
+        assert_eq!(object.event.alarm_count, 1);
+        assert_eq!(
+            object.event.organizer.as_deref(),
+            Some("mailto:ana@example.com")
+        );
+    }
+
+    #[test]
+    fn alarm_count_is_zero_when_there_are_no_reminders() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(CalendarObject::parse(ics).unwrap().event.alarm_count, 0);
     }
 
     #[test]

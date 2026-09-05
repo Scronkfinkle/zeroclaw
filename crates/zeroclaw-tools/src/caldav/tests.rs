@@ -631,6 +631,89 @@ async fn update_event_sends_if_match_and_preserves_unspecified_fields() {
 }
 
 #[tokio::test]
+async fn update_event_preserves_reminders_and_unmodelled_properties() {
+    // Regression: regenerating the .ics from the parsed struct silently
+    // deleted the user's reminder, the organizer, and the timezone block.
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+
+    let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+        BEGIN:VTIMEZONE\r\nTZID:America/Chicago\r\nEND:VTIMEZONE\r\n\
+        BEGIN:VEVENT\r\nUID:abc\r\nSUMMARY:Lunch\r\nDTSTART:20260904T120000Z\r\n\
+        DURATION:PT1H\r\nSEQUENCE:2\r\nTRANSP:OPAQUE\r\n\
+        ORGANIZER;CN=Ana:mailto:ana@example.com\r\n\
+        X-JMAP-USEDEFAULTALERTS;VALUE=BOOLEAN:TRUE\r\n\
+        BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+    Mock::given(method("REPORT"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(event_report_xml(ics)))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(header("if-match", "\"etag-1\""))
+        .and(body_string_contains("SUMMARY:Brunch"))
+        .and(body_string_contains("BEGIN:VALARM"))
+        .and(body_string_contains("TRIGGER:-PT15M"))
+        .and(body_string_contains("ORGANIZER;CN=Ana:mailto:ana@example.com"))
+        .and(body_string_contains("BEGIN:VTIMEZONE"))
+        .and(body_string_contains("TRANSP:OPAQUE"))
+        .and(body_string_contains("X-JMAP-USEDEFAULTALERTS"))
+        // SEQUENCE must advance so other clients treat the edit as newer.
+        .and(body_string_contains("SEQUENCE:3"))
+        .respond_with(ResponseTemplate::new(204).insert_header("etag", "\"etag-2\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = tool(&format!("{}/dav", server.uri()))
+        .execute(json!({"action": "update_event", "uid": "abc", "summary": "Brunch"}))
+        .await
+        .expect("no host error");
+    assert!(result.success, "unexpected error: {:?}", result.error);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn changing_the_end_drops_duration_so_the_component_stays_valid() {
+    // DTEND and DURATION are mutually exclusive under RFC 5545.
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+
+    let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\r\nSUMMARY:Lunch\r\n\
+        DTSTART:20260904T120000Z\r\nDURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    Mock::given(method("REPORT"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(event_report_xml(ics)))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(body_string_contains("DTEND:20260904T140000Z"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = tool(&format!("{}/dav", server.uri()))
+        .execute(json!({
+            "action": "update_event", "uid": "abc", "end": "2026-09-04T14:00:00Z"
+        }))
+        .await
+        .expect("no host error");
+    assert!(result.success, "unexpected error: {:?}", result.error);
+
+    // Assert the negative directly: the received body must not carry both.
+    let requests = server.received_requests().await.expect("requests recorded");
+    let put = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .expect("a PUT was made");
+    let body = String::from_utf8_lossy(&put.body);
+    assert!(
+        !body.contains("DURATION:"),
+        "DTEND and DURATION must not coexist:\n{body}"
+    );
+}
+
+#[tokio::test]
 async fn update_event_surfaces_a_412_as_a_conflict_rather_than_retrying() {
     let server = MockServer::start().await;
     mount_discovery(&server).await;

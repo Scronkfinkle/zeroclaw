@@ -119,7 +119,7 @@ tool-http-request = Make HTTP requests to external APIs. Supports GET, POST, PUT
 
 tool-image-info = Read image file metadata (format, dimensions, size) and optionally return base64-encoded data.
 
-tool-caldav = Read and manage calendar events on a CalDAV server (Fastmail, iCloud, Nextcloud, Radicale, and other RFC 4791 servers). List calendars, list events in a date range, read one event, and, when the operator has allow-listed the action, create, update, or delete events. Repeating events are listed as individual occurrences but cannot be edited or deleted through this tool.
+tool-caldav = Read and manage calendar events on a CalDAV server (Fastmail, iCloud, Nextcloud, Radicale, and other RFC 4791 servers). List calendars, list events in a date range, read one event, and, when the operator has allow-listed the action, create, update, or delete events, including their reminder alerts. Repeating events are listed as individual occurrences but cannot be edited or deleted through this tool.
 
 tool-jira = Interact with Jira: read tickets, search with JQL, add comments, list projects and per-issue transitions, transition an issue through its workflow, and create new issues.
 

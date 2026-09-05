@@ -24,7 +24,7 @@ use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
 use client::{CalDavClient, WriteOutcome};
 use discovery::{Calendar, select_calendar};
-use ical::{CalendarObject, EventTime, PropertyChange, VEvent};
+use ical::{Alarm, CalendarObject, EventTime, PropertyChange, VEvent};
 
 /// Every action this tool understands.
 const VALID_ACTIONS: &[&str] = &[
@@ -245,9 +245,13 @@ impl CalDavTool {
     }
 
     async fn create_event(&self, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        // Validate every argument before touching the network, so a malformed
+        // call fails immediately instead of after a discovery round trip.
         let summary = require_str(args, "summary")?;
         let start = require_time(args, "start")?;
         let end = resolve_end(args, &start)?;
+        let reminders = parse_reminders(args)?.unwrap_or_default();
+
         let calendar = self.target_calendar(args).await?;
 
         let uid = format!("{}@zeroclaw", uuid::Uuid::new_v4());
@@ -259,6 +263,7 @@ impl CalDavTool {
             start: Some(start),
             end: Some(end),
             attendees: string_list(args, "attendees"),
+            alarms: reminders.into_iter().map(Alarm::before_start).collect(),
             ..Default::default()
         };
 
@@ -287,6 +292,8 @@ impl CalDavTool {
 
     async fn update_event(&self, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let uid = require_str(args, "uid")?;
+        // Validated before the lookup so bad input fails without a round trip.
+        let reminders = parse_reminders(args)?;
         let calendar = self.target_calendar(args).await?;
 
         let Some((object, url, etag)) = self.find_event(&calendar, uid).await? else {
@@ -355,6 +362,20 @@ impl CalDavTool {
                     .collect(),
             ));
             updated.attendees = attendees;
+        }
+        if let Some(minutes) = reminders {
+            let alarms: Vec<Alarm> = minutes.into_iter().map(Alarm::before_start).collect();
+            changes.push(PropertyChange::replace_component(
+                "VALARM",
+                alarms.iter().map(Alarm::to_lines).collect(),
+            ));
+            // Fastmail's JMAP bridge ignores per-event alarms while this flag
+            // is set, so an explicit reminder would silently not fire.
+            changes.push(PropertyChange::set(
+                "X-JMAP-USEDEFAULTALERTS",
+                "X-JMAP-USEDEFAULTALERTS;VALUE=BOOLEAN:FALSE",
+            ));
+            updated.alarms = alarms;
         }
 
         if changes.is_empty() {
@@ -464,7 +485,25 @@ fn event_json(event: &VEvent, href: Option<&str>, etag: Option<&str>) -> serde_j
         "attendees": event.attendees,
         "recurring": event.is_recurring(),
         "rrule": event.rrule,
-        "reminder_count": event.alarm_count,
+        // Ordinary "N minutes before" reminders, as plain numbers.
+        "reminders_minutes_before": event
+            .alarms
+            .iter()
+            .filter(|a| a.is_simple_before_start())
+            .filter_map(|a| a.minutes_before)
+            .collect::<Vec<_>>(),
+        // Anything that is not that shape (absolute time, relative to the end)
+        // is reported verbatim rather than coerced into a misleading number.
+        "reminders_other": event
+            .alarms
+            .iter()
+            .filter(|a| !a.is_simple_before_start())
+            .map(|a| json!({
+                "trigger": a.trigger,
+                "related_to_end": a.related_to_end,
+                "action": a.action,
+            }))
+            .collect::<Vec<_>>(),
         "href": href,
         "etag": etag,
     })
@@ -482,6 +521,50 @@ fn optional_string(args: &serde_json::Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
+}
+
+/// Read the `reminders` argument: minutes before the event start.
+///
+/// Returns `None` when the caller did not mention reminders at all, which an
+/// update treats as "leave the existing ones alone". `Some(vec![])` is an
+/// explicit request to clear them.
+fn parse_reminders(args: &serde_json::Value) -> anyhow::Result<Option<Vec<i64>>> {
+    let Some(value) = args.get("reminders") else {
+        return Ok(None);
+    };
+    // `null` is also "clear them", which is how a model usually spells removal.
+    if value.is_null() {
+        return Ok(Some(Vec::new()));
+    }
+    let items = value.as_array().ok_or_else(|| {
+        anyhow::Error::msg(
+            "'reminders' must be an array of minutes before the event, e.g. [15, 60]",
+        )
+    })?;
+
+    let mut minutes = Vec::with_capacity(items.len());
+    for item in items {
+        let n = item.as_i64().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "'reminders' entries must be whole numbers of minutes; got {item}"
+            ))
+        })?;
+        if n < 0 {
+            anyhow::bail!(
+                "'reminders' entries are minutes *before* the event, so they cannot be \
+                 negative; got {n}"
+            );
+        }
+        // A year of lead time is past the point of being a reminder, and large
+        // values are far more likely to be a unit mix-up (seconds for minutes).
+        if n > 525_600 {
+            anyhow::bail!("'reminders' entry {n} is more than a year before the event");
+        }
+        if !minutes.contains(&n) {
+            minutes.push(n);
+        }
+    }
+    Ok(Some(minutes))
 }
 
 fn string_list(args: &serde_json::Value, key: &str) -> Vec<String> {
@@ -591,8 +674,8 @@ impl Tool for CalDavTool {
         "Read and manage calendar events on a CalDAV server (Fastmail, iCloud, Nextcloud, \
          Radicale, and other RFC 4791 servers). List calendars, list events in a date range, \
          read one event, and — when the operator has allow-listed the action — create, update, \
-         or delete events. Repeating events are listed as individual occurrences but cannot be \
-         edited or deleted through this tool."
+         or delete events, including their reminder alerts. Repeating events are listed as \
+         individual occurrences but cannot be edited or deleted through this tool."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -635,6 +718,11 @@ impl Tool for CalDavTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Attendee email addresses. Note that this records attendees on the event; it does not send invitation emails."
+                },
+                "reminders": {
+                    "type": "array",
+                    "items": { "type": "integer", "minimum": 0 },
+                    "description": "Reminder alerts, as whole minutes before the event starts (e.g. [15] for 15 minutes before, [10, 1440] for ten minutes and one day before). On update_event this replaces all existing reminders; pass [] to remove them. Omit to leave existing reminders untouched."
                 }
             }
         })

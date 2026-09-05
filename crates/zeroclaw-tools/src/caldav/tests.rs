@@ -714,6 +714,169 @@ async fn changing_the_end_drops_duration_so_the_component_stays_valid() {
 }
 
 #[tokio::test]
+async fn create_event_writes_requested_reminders() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+
+    Mock::given(method("PUT"))
+        .and(body_string_contains("TRIGGER:-PT15M"))
+        .and(body_string_contains("TRIGGER:-PT1440M"))
+        .and(body_string_contains("ACTION:DISPLAY"))
+        // Without this, Fastmail ignores the alarms we just set.
+        .and(body_string_contains("X-JMAP-USEDEFAULTALERTS;VALUE=BOOLEAN:FALSE"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = tool(&format!("{}/dav", server.uri()))
+        .execute(json!({
+            "action": "create_event",
+            "summary": "Dentist",
+            "start": "2026-09-04T15:00:00Z",
+            "reminders": [15, 1440],
+        }))
+        .await
+        .expect("no host error");
+    assert!(result.success, "unexpected error: {:?}", result.error);
+    assert_eq!(
+        result.output.data().unwrap()["reminders_minutes_before"],
+        json!([15, 1440])
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn update_event_can_replace_and_clear_reminders() {
+    for (reminders, expect_alarm) in [(json!([30]), true), (json!([]), false)] {
+        let server = MockServer::start().await;
+        mount_discovery(&server).await;
+
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\r\nSUMMARY:Lunch\r\n\
+            DTSTART:20260904T120000Z\r\n\
+            BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\n\
+            END:VEVENT\r\nEND:VCALENDAR\r\n";
+        Mock::given(method("REPORT"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(event_report_xml(ics)))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = tool(&format!("{}/dav", server.uri()))
+            .execute(json!({
+                "action": "update_event", "uid": "abc", "reminders": reminders
+            }))
+            .await
+            .expect("no host error");
+        assert!(result.success, "unexpected error: {:?}", result.error);
+
+        let requests = server.received_requests().await.expect("recorded");
+        let put = requests
+            .iter()
+            .find(|r| r.method.as_str() == "PUT")
+            .expect("a PUT was made");
+        let body = String::from_utf8_lossy(&put.body);
+        // The pre-existing 5-minute alarm is replaced either way.
+        assert!(!body.contains("-PT5M"), "old reminder survived:\n{body}");
+        if expect_alarm {
+            assert!(
+                body.contains("TRIGGER:-PT30M"),
+                "new reminder missing:\n{body}"
+            );
+        } else {
+            assert!(
+                !body.contains("VALARM"),
+                "reminders should be cleared:\n{body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn omitting_reminders_on_update_leaves_them_alone() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+
+    let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\r\nSUMMARY:Lunch\r\n\
+        DTSTART:20260904T120000Z\r\n\
+        BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+    Mock::given(method("REPORT"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(event_report_xml(ics)))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(body_string_contains("TRIGGER:-PT5M"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = tool(&format!("{}/dav", server.uri()))
+        .execute(json!({"action": "update_event", "uid": "abc", "summary": "Brunch"}))
+        .await
+        .expect("no host error");
+    assert!(result.success, "unexpected error: {:?}", result.error);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn get_event_reports_reminders_separating_odd_triggers() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+
+    let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\r\nSUMMARY:Lunch\r\n\
+        DTSTART:20260904T120000Z\r\n\
+        BEGIN:VALARM\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n\
+        BEGIN:VALARM\r\nTRIGGER;RELATED=END:-PT5M\r\nEND:VALARM\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+    Mock::given(method("REPORT"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(event_report_xml(ics)))
+        .mount(&server)
+        .await;
+
+    let result = tool(&format!("{}/dav", server.uri()))
+        .execute(json!({"action": "get_event", "uid": "abc"}))
+        .await
+        .expect("no host error");
+    assert!(result.success, "unexpected error: {:?}", result.error);
+
+    let data = result.output.data().expect("structured output");
+    assert_eq!(data["reminders_minutes_before"], json!([15]));
+    assert_eq!(data["reminders_other"][0]["related_to_end"], true);
+}
+
+#[tokio::test]
+async fn invalid_reminders_are_rejected_with_a_usable_message() {
+    // Port 1 is closed, so any error mentioning the connection would mean
+    // validation ran after the network call instead of before it.
+    let t = tool("http://127.0.0.1:1/dav");
+    for (bad, expect) in [
+        (json!("15"), "must be an array"),
+        (json!([-5]), "cannot be negative"),
+        (json!([1.5]), "whole numbers"),
+        (json!([999_999]), "more than a year"),
+    ] {
+        let result = t
+            .execute(json!({
+                "action": "create_event",
+                "summary": "s",
+                "start": "2026-09-04T15:00:00Z",
+                "reminders": bad,
+            }))
+            .await
+            .expect("no host error");
+        assert!(!result.success, "should reject {bad}");
+        let err = result.error.unwrap();
+        assert!(err.contains(expect), "for {bad}, got: {err}");
+    }
+}
+
+#[tokio::test]
 async fn update_event_surfaces_a_412_as_a_conflict_rather_than_retrying() {
     let server = MockServer::start().await;
     mount_discovery(&server).await;

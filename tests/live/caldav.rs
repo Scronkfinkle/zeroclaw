@@ -142,10 +142,15 @@ async fn live_caldav_create_update_delete_roundtrip() {
             "location": "Nowhere",
             "start": "2026-12-01T15:00:00Z",
             "duration_minutes": 30,
+            "reminders": [15],
         }))
         .await
         .expect("no host error");
     assert!(created.success, "create_event failed: {:?}", created.error);
+    assert_eq!(
+        created.output.data().expect("data")["reminders_minutes_before"],
+        json!([15])
+    );
     let uid = created.output.data().expect("data")["uid"]
         .as_str()
         .expect("uid")
@@ -168,6 +173,11 @@ async fn live_caldav_create_update_delete_roundtrip() {
         fetched_data["etag"].as_str().is_some(),
         "an ETag is required for the conditional update below"
     );
+    assert_eq!(
+        fetched_data["reminders_minutes_before"],
+        json!([15]),
+        "the reminder should survive the round trip to the server"
+    );
 
     let updated = tool
         .execute(json!({
@@ -189,6 +199,13 @@ async fn live_caldav_create_update_delete_roundtrip() {
     assert_eq!(
         after_data["location"], "Nowhere",
         "a partial update must not blank unspecified fields"
+    );
+    // Regression: the old regenerate-from-scratch update silently deleted the
+    // reminder whenever any other field was edited.
+    assert_eq!(
+        after_data["reminders_minutes_before"],
+        json!([15]),
+        "renaming the event must not delete its reminder"
     );
 
     let deleted = tool

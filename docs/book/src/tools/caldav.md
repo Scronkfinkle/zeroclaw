@@ -104,6 +104,32 @@ If your server does not support server-side expansion, the tool falls back to
 reporting the raw recurrence rule and says so in its output rather than
 under-reporting your schedule.
 
+## Reminders
+
+Events can carry alerts (`VALARM` in the spec). Pass `reminders` as whole
+minutes before the start:
+
+```
+"remind me 15 minutes before"        → reminders: [15]
+"remind me a day and an hour before" → reminders: [1440, 60]
+```
+
+On `update_event`, `reminders` **replaces** whatever the event had. Pass `[]`
+to remove all reminders, or omit the field entirely to leave them untouched.
+
+Reads report them two ways. Ordinary alerts appear as plain numbers in
+`reminders_minutes_before`. Anything that is not "N minutes before the start",
+such as an alert at an absolute time or one relative to the event's *end*, is
+reported verbatim under `reminders_other` rather than being flattened into a
+misleading number.
+
+On Fastmail, setting a reminder also clears the account's "use default alerts"
+flag for that event. Without that, Fastmail would keep applying your default
+alert and ignore the one you asked for.
+
+Note that this sets alerts *for you*. It does not email attendees; see the
+limitations below.
+
 ## Concurrency
 
 Updates and deletes carry the event's `ETag` as a precondition. If the event
@@ -117,5 +143,7 @@ earlier.
 - It does not send meeting invitations. Adding `attendees` records them on the
   event; it does not email anyone (no iTIP or scheduling support).
 - It does not create, rename, or delete calendars.
-- It does not manage tasks (`VTODO`) or free/busy queries.
+- It does not manage tasks or to-do lists (`VTODO`, what Apple calls
+  Reminders), or free/busy queries. Fastmail calendars advertise `VEVENT`
+  support only, so tasks would be rejected there in any case.
 - It does not edit repeating events, as described above.

@@ -34,9 +34,59 @@ pub struct VEvent {
     /// `SEQUENCE`, the component's revision counter. An update bumps it so
     /// other clients and attendees see the edit as newer.
     pub sequence: Option<u32>,
-    /// Number of `VALARM` sub-components. Reported so a caller can tell that
-    /// an event has reminders attached without this parser modelling them.
-    pub alarm_count: usize,
+    /// `VALARM` sub-components: the event's reminders.
+    pub alarms: Vec<Alarm>,
+}
+
+/// A `VALARM` reminder attached to an event (RFC 5545 §3.6.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Alarm {
+    /// Minutes before the reference point, when the trigger is a plain
+    /// relative duration. `Some(15)` means "15 minutes before"; a negative
+    /// value means after. `None` for an absolute trigger, which is reported
+    /// through [`Alarm::trigger`] instead of being coerced into a number.
+    pub minutes_before: Option<i64>,
+    /// True when the trigger is relative to the event's end (`RELATED=END`)
+    /// rather than its start.
+    pub related_to_end: bool,
+    /// The raw `TRIGGER` value, always preserved.
+    pub trigger: String,
+    /// `ACTION`, e.g. `DISPLAY`, `AUDIO`, `EMAIL`.
+    pub action: Option<String>,
+}
+
+impl Alarm {
+    /// Whether this is the ordinary "N minutes before the event starts" shape
+    /// the tool can express as a number.
+    pub fn is_simple_before_start(&self) -> bool {
+        !self.related_to_end && self.minutes_before.is_some_and(|m| m >= 0)
+    }
+
+    /// Render as `VALARM` content lines.
+    pub fn to_lines(&self) -> Vec<String> {
+        vec![
+            "BEGIN:VALARM".to_string(),
+            format!("ACTION:{}", self.action.as_deref().unwrap_or("DISPLAY")),
+            format!("TRIGGER:{}", self.trigger),
+            "DESCRIPTION:Reminder".to_string(),
+            "END:VALARM".to_string(),
+        ]
+    }
+
+    /// A display reminder firing `minutes` before the event starts.
+    pub fn before_start(minutes: i64) -> Self {
+        Self {
+            minutes_before: Some(minutes),
+            related_to_end: false,
+            // RFC 5545 durations are positive with a leading `-` for "before".
+            trigger: if minutes == 0 {
+                "PT0S".to_string()
+            } else {
+                format!("-PT{minutes}M")
+            },
+            action: Some("DISPLAY".to_string()),
+        }
+    }
 }
 
 /// A `DTSTART`/`DTEND` value. All-day events carry a date with no time, and
@@ -155,6 +205,14 @@ impl VEvent {
         for attendee in &self.attendees {
             lines.push(format!("ATTENDEE:{}", escape_text(attendee)));
         }
+        if !self.alarms.is_empty() {
+            // Fastmail's JMAP bridge suppresses per-event alarms unless this is
+            // explicitly false, so an added reminder would never fire.
+            lines.push("X-JMAP-USEDEFAULTALERTS;VALUE=BOOLEAN:FALSE".to_string());
+            for alarm in &self.alarms {
+                lines.extend(alarm.to_lines());
+            }
+        }
         lines.push("END:VEVENT".to_string());
         lines.push("END:VCALENDAR".to_string());
 
@@ -174,6 +232,13 @@ pub enum PropertyChange {
     /// Replace every occurrence of a repeatable property with these lines.
     /// An empty `lines` removes them all.
     Replace { name: String, lines: Vec<String> },
+    /// Replace every nested sub-component of this type (e.g. `VALARM`) with
+    /// `blocks`, each a complete `BEGIN:`/`END:` run. An empty `blocks`
+    /// removes them all.
+    ReplaceComponent {
+        name: String,
+        blocks: Vec<Vec<String>>,
+    },
 }
 
 impl PropertyChange {
@@ -197,9 +262,19 @@ impl PropertyChange {
         }
     }
 
+    pub fn replace_component(name: &str, blocks: Vec<Vec<String>>) -> Self {
+        Self::ReplaceComponent {
+            name: name.to_string(),
+            blocks,
+        }
+    }
+
     fn name(&self) -> &str {
         match self {
-            Self::Set { name, .. } | Self::Remove { name } | Self::Replace { name, .. } => name,
+            Self::Set { name, .. }
+            | Self::Remove { name }
+            | Self::Replace { name, .. }
+            | Self::ReplaceComponent { name, .. } => name,
         }
     }
 }
@@ -247,9 +322,11 @@ impl CalendarObject {
         let mut in_event = false;
         let mut done_event = false;
         let mut nested = 0usize;
-        // Which `Set`/`Replace` changes already found a line to overwrite;
-        // the rest are appended before END:VEVENT.
+        // Which changes already found something to overwrite; the rest are
+        // appended before END:VEVENT.
         let mut applied: Vec<bool> = vec![false; changes.len()];
+        // Set while discarding the lines of a sub-component being replaced.
+        let mut dropping_component: Option<String> = None;
 
         for line in &self.lines {
             let upper = line.trim().to_ascii_uppercase();
@@ -268,6 +345,11 @@ impl CalendarObject {
                     match change {
                         PropertyChange::Set { line, .. } => out.push(line.clone()),
                         PropertyChange::Replace { lines, .. } => out.extend(lines.iter().cloned()),
+                        PropertyChange::ReplaceComponent { blocks, .. } => {
+                            for block in blocks {
+                                out.extend(block.iter().cloned());
+                            }
+                        }
                         PropertyChange::Remove { .. } => {}
                     }
                 }
@@ -277,6 +359,38 @@ impl CalendarObject {
                 continue;
             }
             if in_event {
+                // A sub-component being replaced wholesale: drop its lines and
+                // emit the replacement blocks once, at the first occurrence.
+                if nested == 0
+                    && let Some(sub) = upper.strip_prefix("BEGIN:")
+                    && let Some(idx) = changes.iter().position(|c| {
+                        matches!(c, PropertyChange::ReplaceComponent { .. }) && c.name() == sub
+                    })
+                {
+                    if !applied[idx] {
+                        if let PropertyChange::ReplaceComponent { blocks, .. } = &changes[idx] {
+                            for block in blocks {
+                                out.extend(block.iter().cloned());
+                            }
+                        }
+                        applied[idx] = true;
+                    }
+                    dropping_component = Some(sub.to_string());
+                    nested += 1;
+                    continue;
+                }
+                if let Some(target) = dropping_component.clone() {
+                    if upper.starts_with("BEGIN:") {
+                        nested += 1;
+                    } else if upper.starts_with("END:") {
+                        nested = nested.saturating_sub(1);
+                        if nested == 0 && upper == format!("END:{target}") {
+                            dropping_component = None;
+                        }
+                    }
+                    // Every line of the replaced component is discarded.
+                    continue;
+                }
                 if upper.starts_with("BEGIN:") {
                     nested += 1;
                 } else if upper.starts_with("END:") {
@@ -289,7 +403,9 @@ impl CalendarObject {
                 }
 
                 if let Some(name) = property_name(line)
-                    && let Some(idx) = changes.iter().position(|c| c.name() == name)
+                    && let Some(idx) = changes.iter().position(|c| {
+                        c.name() == name && !matches!(c, PropertyChange::ReplaceComponent { .. })
+                    })
                 {
                     match &changes[idx] {
                         PropertyChange::Remove { .. } => { /* drop this line */ }
@@ -306,6 +422,7 @@ impl CalendarObject {
                                 applied[idx] = true;
                             }
                         }
+                        PropertyChange::ReplaceComponent { .. } => unreachable!("filtered above"),
                     }
                     continue;
                 }
@@ -347,6 +464,8 @@ pub fn parse_events(ics: &str) -> Vec<VEvent> {
     // `DURATION` for the component being read. Resolved into `end` when the
     // component closes, because DURATION may precede or follow DTSTART.
     let mut duration: Option<ChronoDuration> = None;
+    // The VALARM currently being collected, if any.
+    let mut alarm: Option<Alarm> = None;
 
     for line in lines {
         let trimmed = line.trim();
@@ -363,6 +482,7 @@ pub fn parse_events(ics: &str) -> Vec<VEvent> {
         if upper == "BEGIN:VEVENT" && skip_depth == 0 {
             current = Some(VEvent::default());
             duration = None;
+            alarm = None;
             continue;
         }
         if upper == "END:VEVENT" && skip_depth == 0 {
@@ -381,19 +501,28 @@ pub fn parse_events(ics: &str) -> Vec<VEvent> {
             continue;
         }
         if upper.starts_with("BEGIN:") {
-            // A VALARM directly inside this event is a reminder. Count it while
-            // still skipping its properties, which belong to the alarm.
-            if upper == "BEGIN:VALARM"
-                && skip_depth == 0
-                && let Some(event) = current.as_mut()
-            {
-                event.alarm_count += 1;
+            // A VALARM directly inside this event is a reminder; collect its
+            // properties rather than skipping them.
+            if upper == "BEGIN:VALARM" && skip_depth == 0 && current.is_some() {
+                alarm = Some(Alarm::default());
             }
             skip_depth += 1;
             continue;
         }
         if upper.starts_with("END:") {
+            // Closing the VALARM we were collecting.
+            if skip_depth == 1
+                && let Some(finished) = alarm.take()
+                && let Some(event) = current.as_mut()
+            {
+                event.alarms.push(finished);
+            }
             skip_depth = skip_depth.saturating_sub(1);
+            continue;
+        }
+        // Alarm properties belong to the alarm, never to the event.
+        if let Some(current_alarm) = alarm.as_mut() {
+            apply_alarm_property(current_alarm, trimmed);
             continue;
         }
         if skip_depth > 0 {
@@ -410,6 +539,31 @@ pub fn parse_events(ics: &str) -> Vec<VEvent> {
     }
 
     events
+}
+
+/// Apply one `VALARM` property line to the alarm being collected.
+fn apply_alarm_property(alarm: &mut Alarm, line: &str) {
+    let Some((name, params, value)) = split_property(line) else {
+        return;
+    };
+    match name.as_str() {
+        "ACTION" => alarm.action = Some(value.trim().to_string()),
+        "TRIGGER" => {
+            alarm.trigger = value.trim().to_string();
+            alarm.related_to_end =
+                param(&params, "RELATED").is_some_and(|v| v.eq_ignore_ascii_case("END"));
+            // An absolute trigger has no minutes-before reading; leave it
+            // `None` so callers report the raw value instead of a wrong number.
+            let is_absolute =
+                param(&params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE-TIME"));
+            alarm.minutes_before = if is_absolute {
+                None
+            } else {
+                parse_duration(value).map(|d| -d.num_minutes())
+            };
+        }
+        _ => {}
+    }
 }
 
 /// Parse a `DURATION:` line into a [`ChronoDuration`], or `None` when the line
@@ -886,7 +1040,8 @@ mod tests {
         assert_eq!(back.event.summary.as_deref(), Some("Canoeing"));
         assert_eq!(back.event.sequence, Some(4));
         assert_eq!(
-            back.event.alarm_count, 1,
+            back.event.alarms.len(),
+            1,
             "the alarm survived the round trip"
         );
         // DURATION still drives the end time.
@@ -901,7 +1056,7 @@ mod tests {
     fn sequence_and_alarm_count_are_parsed() {
         let object = CalendarObject::parse(REAL_WORLD_ICS).expect("parses");
         assert_eq!(object.event.sequence, Some(3));
-        assert_eq!(object.event.alarm_count, 1);
+        assert_eq!(object.event.alarms.len(), 1);
         assert_eq!(
             object.event.organizer.as_deref(),
             Some("mailto:ana@example.com")
@@ -911,7 +1066,164 @@ mod tests {
     #[test]
     fn alarm_count_is_zero_when_there_are_no_reminders() {
         let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        assert_eq!(CalendarObject::parse(ics).unwrap().event.alarm_count, 0);
+        assert_eq!(CalendarObject::parse(ics).unwrap().event.alarms.len(), 0);
+    }
+
+    #[test]
+    fn alarm_trigger_is_read_as_minutes_before_start() {
+        let ics = "BEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260905T140000Z\r\n\
+            BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n\
+            BEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER:-P1D\r\nEND:VALARM\r\n\
+            END:VEVENT";
+        let alarms = &parse_events(ics)[0].alarms;
+        assert_eq!(alarms.len(), 2);
+        assert_eq!(alarms[0].minutes_before, Some(15));
+        assert_eq!(alarms[0].action.as_deref(), Some("DISPLAY"));
+        assert!(alarms[0].is_simple_before_start());
+        assert_eq!(alarms[1].minutes_before, Some(1440));
+        assert_eq!(alarms[1].action.as_deref(), Some("EMAIL"));
+    }
+
+    #[test]
+    fn absolute_and_end_relative_triggers_are_not_coerced_to_a_number() {
+        // Reporting either as "N minutes before start" would be a lie.
+        let ics = "BEGIN:VEVENT\r\nUID:a\r\n\
+            BEGIN:VALARM\r\nTRIGGER;VALUE=DATE-TIME:20260905T120000Z\r\nEND:VALARM\r\n\
+            BEGIN:VALARM\r\nTRIGGER;RELATED=END:-PT5M\r\nEND:VALARM\r\n\
+            END:VEVENT";
+        let alarms = &parse_events(ics)[0].alarms;
+        assert_eq!(alarms[0].minutes_before, None);
+        assert_eq!(alarms[0].trigger, "20260905T120000Z");
+        assert!(!alarms[0].is_simple_before_start());
+
+        assert!(alarms[1].related_to_end);
+        assert!(!alarms[1].is_simple_before_start());
+        assert_eq!(alarms[1].trigger, "-PT5M");
+    }
+
+    #[test]
+    fn alarm_after_start_is_negative_minutes_before() {
+        let ics = "BEGIN:VEVENT\r\nUID:a\r\n\
+            BEGIN:VALARM\r\nTRIGGER:PT10M\r\nEND:VALARM\r\nEND:VEVENT";
+        let alarms = &parse_events(ics)[0].alarms;
+        assert_eq!(alarms[0].minutes_before, Some(-10));
+        assert!(!alarms[0].is_simple_before_start());
+    }
+
+    #[test]
+    fn alarm_properties_never_leak_into_the_event() {
+        let ics = "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:Real\r\n\
+            BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\n\
+            SUMMARY:Alarm summary\r\nDESCRIPTION:Alarm body\r\nEND:VALARM\r\n\
+            END:VEVENT";
+        let event = &parse_events(ics)[0];
+        assert_eq!(event.summary.as_deref(), Some("Real"));
+        assert_eq!(event.description, None);
+        assert_eq!(event.alarms.len(), 1);
+    }
+
+    #[test]
+    fn before_start_builds_a_valid_trigger() {
+        assert_eq!(Alarm::before_start(15).trigger, "-PT15M");
+        assert_eq!(Alarm::before_start(1440).trigger, "-PT1440M");
+        // "At the time of the event" has no minus sign.
+        assert_eq!(Alarm::before_start(0).trigger, "PT0S");
+    }
+
+    #[test]
+    fn alarms_written_by_to_ics_read_back_identically() {
+        let event = VEvent {
+            uid: "a".into(),
+            start: Some(EventTime::DateTime(
+                Utc.with_ymd_and_hms(2026, 9, 5, 14, 0, 0).unwrap(),
+            )),
+            alarms: vec![Alarm::before_start(15), Alarm::before_start(1440)],
+            ..Default::default()
+        };
+        let ics = event.to_ics();
+        // Fastmail ignores explicit alarms unless default alerts are off.
+        assert!(ics.contains("X-JMAP-USEDEFAULTALERTS;VALUE=BOOLEAN:FALSE"));
+
+        let back = parse_events(&ics);
+        let minutes: Vec<i64> = back[0]
+            .alarms
+            .iter()
+            .filter_map(|a| a.minutes_before)
+            .collect();
+        assert_eq!(minutes, vec![15, 1440]);
+    }
+
+    #[test]
+    fn to_ics_omits_the_default_alerts_flag_when_there_are_no_reminders() {
+        let event = VEvent {
+            uid: "a".into(),
+            ..Default::default()
+        };
+        let ics = event.to_ics();
+        assert!(!ics.contains("USEDEFAULTALERTS"));
+        assert!(!ics.contains("VALARM"));
+    }
+
+    #[test]
+    fn replace_component_swaps_alarms_and_leaves_the_rest_intact() {
+        let object = CalendarObject::parse(REAL_WORLD_ICS).expect("parses");
+        let out = object.patched(&[PropertyChange::replace_component(
+            "VALARM",
+            vec![Alarm::before_start(60).to_lines()],
+        )]);
+        assert!(out.contains("TRIGGER:-PT60M"), "new alarm missing:\n{out}");
+        assert!(
+            !out.contains("TRIGGER:-PT15M"),
+            "old alarm survived:\n{out}"
+        );
+        assert_eq!(out.matches("BEGIN:VALARM").count(), 1);
+        // Everything outside the alarm is untouched.
+        assert!(out.contains("SUMMARY:Kayaking"));
+        assert!(out.contains("BEGIN:VTIMEZONE"));
+        assert!(out.contains("ORGANIZER;CN=Ana:mailto:ana@example.com"));
+    }
+
+    #[test]
+    fn replace_component_with_no_blocks_removes_every_alarm() {
+        let object = CalendarObject::parse(REAL_WORLD_ICS).expect("parses");
+        let out = object.patched(&[PropertyChange::replace_component("VALARM", Vec::new())]);
+        assert!(!out.contains("VALARM"), "alarms should be gone:\n{out}");
+        assert!(out.contains("SUMMARY:Kayaking"), "event must survive");
+        let back = CalendarObject::parse(&out).expect("reparses");
+        assert!(back.event.alarms.is_empty());
+    }
+
+    #[test]
+    fn replace_component_adds_alarms_to_an_event_that_had_none() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nSUMMARY:S\r\n\
+            END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let object = CalendarObject::parse(ics).expect("parses");
+        let out = object.patched(&[PropertyChange::replace_component(
+            "VALARM",
+            vec![Alarm::before_start(30).to_lines()],
+        )]);
+        let back = CalendarObject::parse(&out).expect("reparses");
+        assert_eq!(back.event.alarms.len(), 1);
+        assert_eq!(back.event.alarms[0].minutes_before, Some(30));
+        // The block must land inside the event.
+        assert!(out.find("BEGIN:VALARM").unwrap() < out.find("END:VEVENT").unwrap());
+    }
+
+    #[test]
+    fn replacing_alarms_does_not_disturb_multiple_existing_ones() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nSUMMARY:S\r\n\
+            BEGIN:VALARM\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\n\
+            BEGIN:VALARM\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\n\
+            END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let object = CalendarObject::parse(ics).expect("parses");
+        assert_eq!(object.event.alarms.len(), 2);
+        let out = object.patched(&[PropertyChange::replace_component(
+            "VALARM",
+            vec![Alarm::before_start(1).to_lines()],
+        )]);
+        assert_eq!(out.matches("BEGIN:VALARM").count(), 1);
+        assert!(out.contains("TRIGGER:-PT1M"));
+        assert!(!out.contains("-PT5M") && !out.contains("-PT10M"));
     }
 
     #[test]
